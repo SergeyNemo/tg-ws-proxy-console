@@ -1,0 +1,125 @@
+# TG WS Proxy — безопасная версия
+
+SOCKS5-прокси для Telegram Desktop через WebSocket/TLS с исправленными уязвимостями безопасности.
+
+**Авторство**
+
+**Оригинальный проект:** [tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) от [Flowseal](https://github.com/Flowseal) (MIT)  
+**Форк & Исправления:** [Sergey Nemo](https://github.com/SergeyNemo) (2026)
+
+Детали всех изменений в [CHANGES.md](./CHANGES.md).
+
+---
+
+## 🚀 Быстрый старт
+
+### Требования
+
+- Python 3.8+
+- Windows / Linux / macOS
+
+### Установка
+
+```bash
+git clone https://github.com/SergeyNemo/tg-ws-proxy-console
+cd tg-ws-proxy-console
+pip install -r requirements.txt
+
+# Скопируйте пример конфига и заполните свои данные
+cp config/config.example.json config/config.json
+```
+
+Отредактируйте `config/config.json` с вашими параметрами.
+
+### Запуск (консольный режим)
+
+```bash
+python windows.py
+```
+
+### Запуск (прокси-сервер только)
+
+```bash
+python proxy/tg_ws_proxy.py --port 1080 -v
+```
+
+---
+
+## ⚙️ Конфигурация
+
+**Файл:** `config/config.json`
+
+```json
+{
+  "port": 1080,
+  "host": "127.0.0.1",
+  "username": "telegram",
+  "password": "your_strong_password_here",
+  "dc_ip": [
+    "1:149.154.175.50",
+    "2:149.154.167.220",
+    "3:149.154.175.100",
+    "4:149.154.167.91",
+    "5:91.108.56.100"
+  ],
+  "verbose": false
+}
+```
+
+**Параметры:**
+- `port` — SOCKS5 порт (по умолчанию 1080)
+- `host` — интерфейс слушания (`127.0.0.1` только локально)
+- `username` / `password` — SOCKS5 аутентификация
+- `dc_ip` — список Telegram DataCenter адресов
+- `verbose` — включить DEBUG логирование
+
+---
+
+## 📊 Логирование
+
+**Файл:** `logs/proxy.log`
+
+Автоматическая ротация:
+- Размер: 10 МБ на файл
+- Хранит: 3 последних файла
+- Максимум: 40 МБ на диске
+
+Пример:
+```
+2026-03-11 15:40:14 [INFO] stats: total=42 ws=15 tcp_fb=27 pass=0 err=0 up=15.3MB down=42.1MB
+```
+
+---
+
+## 🛡️ Безопасность
+
+**Для локального использования (рекомендуется):**
+```json
+{ "host": "127.0.0.1" }
+```
+- Доступен только с текущей машины
+- Не требует дополнительной защиты
+
+**Для сетевого доступа:**
+- Используйте только в доверенной сети (LAN, VPN)
+- Сильный пароль: 12+ символов, спецсимволы
+- Firewall ограничение: `netsh advfirewall firewall add rule name="TG-SOCKS5" dir=in action=allow protocol=tcp localport=1080 remoteip=192.168.1.0/24`
+- Защита файла: `icacls "config\config.json" /inheritance:r /grant:r "%USERNAME%:F"`
+
+**Детально:** смотрите [CHANGES.md](./CHANGES.md)
+
+---
+
+## � Авторство
+
+**Оригинальный проект:** [Flowseal](https://github.com/Flowseal/tg-ws-proxy) — MIT License
+
+**Исправления безопасности:** [Sergey Nemo](https://github.com/SergeyNemo) (2026)
+
+Детали изменений в [CHANGES.md](./CHANGES.md)
+
+---
+
+## 📄 Лицензия
+
+MIT License — смотрите [LICENSE](./LICENSE) для полного текста.
