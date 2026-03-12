@@ -107,7 +107,7 @@ def load_config() -> Dict[str, Any]:
         missing = required_keys - set(config.keys())
         if missing:
             log = logging.getLogger("tg-ws-console")
-            log.error(f"Missing required config keys: {missing}")
+            log.error(f"Missing required config keys in {CONFIG_FILE}: {missing}")
             sys.exit(1)
         
         return config
@@ -139,6 +139,7 @@ async def run_proxy(config: Dict[str, Any]) -> None:
     # Передаём аутентификацию в tg_ws_proxy через глобальные переменные
     tg_ws_proxy.SOCKS5_USERNAME = username
     tg_ws_proxy.SOCKS5_PASSWORD = password
+    tg_ws_proxy.SOCKS5_AUTH_ENABLED = bool(password)
     
     # Распарсим список DC-адресов
     try:
@@ -178,16 +179,18 @@ async def run_proxy(config: Dict[str, Any]) -> None:
 def main() -> None:
     """Основная функция."""
     # Загружаем конфиг перед логированием, чтобы узнать verbose
+    setup_logging(verbose=False)
     config = load_config()
     verbose = config.get("verbose", False)
     
     # Настраиваем логирование
-    setup_logging(verbose=verbose)
+    logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
     
     log = logging.getLogger("tg-ws-console")
     log.info("=" * 70)
     log.info("TG WS Proxy — Console Edition (Secure)")
     log.info("=" * 70)
+    log.info(f"Config loaded: {CONFIG_FILE}")
     
     # Обработчик сигналов
     def signal_handler(signum, frame):
