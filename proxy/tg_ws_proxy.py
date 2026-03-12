@@ -82,6 +82,8 @@ _active_connections: int = 0
 # Устанавливаются из windows.py при запуске
 SOCKS5_USERNAME: str = ""
 SOCKS5_PASSWORD: str = ""
+# Признак включенной аутентификации (нужен для логов)
+SOCKS5_AUTH_ENABLED: bool = False
 
 # FIX-1: TLS с полной верификацией — check_hostname=True, verify_mode=CERT_REQUIRED
 _ssl_ctx = ssl.create_default_context()
@@ -913,7 +915,14 @@ async def _run(port: int, dc_opt: Dict[int, Optional[str]],
     log.info("  Max connections: %d", MAX_CONNECTIONS)
     log.info("=" * 60)
     log.info("  Configure Telegram Desktop:")
-    log.info("    SOCKS5 proxy -> %s:%d  (no user/pass)", host, port)
+    if SOCKS5_AUTH_ENABLED:
+        # Если запуск через windows.py с аутентификацией
+        user = SOCKS5_USERNAME or "user"
+        log.info("    SOCKS5 proxy -> %s:%d  (user/pass enabled, user=%s)",
+                 host, port, user)
+    else:
+        # При прямом запуске tg_ws_proxy.py
+        log.info("    SOCKS5 proxy -> %s:%d  (no user/pass)", host, port)
     log.info("=" * 60)
 
     async def log_stats():
