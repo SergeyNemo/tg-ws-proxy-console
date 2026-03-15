@@ -410,7 +410,7 @@ class Stats:
     def summary(self) -> str:
         return (f"total={self.connections_total} ws={self.connections_ws} "
                 f"tcp_fb={self.connections_tcp_fallback} "
-                f"http_skip={self.connections_http_rejected} "
+                f"http_pt={self.connections_http_rejected} "
                 f"pass={self.connections_passthrough} "
                 f"err={self.ws_errors} "
                 f"up={_human_bytes(self.bytes_up)} "
@@ -756,12 +756,14 @@ async def _handle_client(reader, writer):
             log.debug("[%s] client disconnected before init", label)
             return
 
-        # HTTP transport -> reject
+        # HTTP transport -> TCP passthrough (CDN/media)
         if _is_http_transport(init):
             _stats.connections_http_rejected += 1
-            log.debug("[%s] HTTP transport to %s:%d (rejected)",
-                      label, dst, port)
-            writer.close()
+            log.info("[%s] HTTP transport to %s:%d -> TCP passthrough",
+                     label, dst, port)
+            ok = await _tcp_fallback(reader, writer, dst, port, init, label)
+            if ok:
+                log.info("[%s] HTTP passthrough closed", label)
             return
 
         # -- Extract DC ID --
