@@ -54,7 +54,8 @@ _IP_TO_DC: Dict[str, int] = {
     '149.154.175.50': 1, '149.154.175.51': 1, '149.154.175.54': 1,
     # DC2
     '149.154.167.41': 2,
-    '149.154.167.50': 2, '149.154.167.51': 2, '149.154.167.220': 2,
+    '149.154.167.50': 2, '149.154.167.51': 2, '149.154.167.151': 2,
+    '149.154.167.220': 2,
     '149.154.167.222': 2,
     # DC3
     '149.154.175.100': 3, '149.154.175.101': 3,
@@ -76,6 +77,11 @@ _ws_blacklist: Set[Tuple[int, bool]] = set()
 # Rate-limit re-attempts per (dc, is_media)
 _dc_fail_until: Dict[Tuple[int, bool], float] = {}
 _DC_FAIL_COOLDOWN = 60.0  # seconds
+
+# IPv6 handling
+IPV6_MODE = "auto"  # auto | on | off
+IPV6_COOLDOWN = 10.0  # seconds to disable IPv6 after failure (auto)
+_ipv6_disabled_until = 0.0
 
 # FIX-5: счётчик активных соединений (asyncio однопоточен — нет гонок)
 _active_connections: int = 0
@@ -343,6 +349,99 @@ def _is_telegram_ip(ip: str) -> bool:
         return False
 
 
+def _is_ipv6_address(addr: str) -> bool:
+    try:
+        _socket.inet_pton(_socket.AF_INET6, addr)
+        return True
+    except OSError:
+        return False
+
+
+def _ipv6_allowed() -> bool:
+    if IPV6_MODE == "on":
+        return True
+    if IPV6_MODE == "off":
+        return False
+    return time.monotonic() >= _ipv6_disabled_until
+
+
+def _mark_ipv6_failure(exc: BaseException) -> None:
+    global _ipv6_disabled_until
+    if IPV6_MODE != "auto":
+        return
+
+    now = time.monotonic()
+    if _ipv6_disabled_until > now:
+        return
+
+    if isinstance(exc, asyncio.TimeoutError):
+        _ipv6_disabled_until = now + IPV6_COOLDOWN
+        log.warning("IPv6 timeout; disabling IPv6 for %ds",
+                    int(IPV6_COOLDOWN))
+        return
+
+    errno = getattr(exc, "errno", None)
+    winerr = getattr(exc, "winerror", None)
+    if errno in (101, 113, 99, 110) or winerr in (10051, 10065):
+        _ipv6_disabled_until = now + IPV6_COOLDOWN
+        log.warning("IPv6 unreachable; disabling IPv6 for %ds",
+                    int(IPV6_COOLDOWN))
+
+
+async def _open_connection_with_policy(host: str, port: int,
+                                       timeout: float = 10.0):
+    """Resolve and connect honoring IPv6 policy. Returns (reader, writer)."""
+    allow_ipv6 = _ipv6_allowed()
+
+    # IPv4 literal
+    try:
+        _socket.inet_aton(host)
+        return await asyncio.wait_for(
+            asyncio.open_connection(host, port), timeout=timeout)
+    except OSError:
+        pass
+
+    # IPv6 literal
+    if _is_ipv6_address(host):
+        if not allow_ipv6:
+            raise OSError(101, "IPv6 disabled")
+        try:
+            return await asyncio.wait_for(
+                asyncio.open_connection(host, port, family=_socket.AF_INET6),
+                timeout=timeout)
+        except Exception as exc:
+            _mark_ipv6_failure(exc)
+            raise
+
+    # Domain name: resolve and attempt
+    infos = await asyncio.get_event_loop().getaddrinfo(
+        host, port, type=_socket.SOCK_STREAM, family=_socket.AF_UNSPEC)
+    addrs = []
+    for family, socktype, proto, _canon, sockaddr in infos:
+        if family == _socket.AF_INET6 and not allow_ipv6:
+            continue
+        addrs.append((family, socktype, proto, sockaddr))
+
+    if allow_ipv6:
+        addrs.sort(key=lambda x: 0 if x[0] == _socket.AF_INET6 else 1)
+
+    last_exc = None
+    for family, _socktype, _proto, sockaddr in addrs:
+        try:
+            return await asyncio.wait_for(
+                asyncio.open_connection(sockaddr[0], sockaddr[1],
+                                        family=family),
+                timeout=timeout)
+        except Exception as exc:
+            last_exc = exc
+            if family == _socket.AF_INET6:
+                _mark_ipv6_failure(exc)
+            continue
+
+    if last_exc:
+        raise last_exc
+    raise OSError("No resolved addresses")
+
 def _is_http_transport(data: bytes) -> bool:
     return (data[:5] == b'POST ' or data[:4] == b'GET ' or
             data[:5] == b'HEAD ' or data[:8] == b'OPTIONS ')
@@ -573,8 +672,7 @@ async def _tcp_fallback(reader, writer, dst, port, init, label,
                         dc=None, is_media=False) -> bool:
     """Fall back to direct TCP to the original DC IP."""
     try:
-        rr, rw = await asyncio.wait_for(
-            asyncio.open_connection(dst, port), timeout=10)
+        rr, rw = await _open_connection_with_policy(dst, port, timeout=10)
     except Exception as exc:
         log.warning("[%s] TCP fallback connect to %s:%d failed: %s",
                     label, dst, port, exc)
@@ -714,19 +812,30 @@ async def _handle_client(reader, writer):
             return
 
         port = struct.unpack('!H', await reader.readexactly(2))[0]
+        dst_is_ipv6 = (atyp == 4)
+
+        if dst_is_ipv6 and not _ipv6_allowed():
+            log.debug("[%s] IPv6 disabled -> reject %s:%d", label, dst, port)
+            writer.write(_socks5_reply(0x08))  # address type not supported
+            await writer.drain()
+            writer.close()
+            return
 
         # -- Non-Telegram IP -> direct passthrough --
         if not _is_telegram_ip(dst):
             _stats.connections_passthrough += 1
             log.debug("[%s] passthrough -> %s:%d", label, dst, port)
             try:
-                rr, rw = await asyncio.wait_for(
-                    asyncio.open_connection(dst, port), timeout=10)
+                rr, rw = await _open_connection_with_policy(
+                    dst, port, timeout=10)
             except Exception as exc:
                 log.warning("[%s] passthrough failed to %s: %s: %s",
                             label, dst, type(exc).__name__,
                             str(exc) or "(no message)")
-                writer.write(_socks5_reply(0x05))
+                if dst_is_ipv6 and IPV6_MODE != "on":
+                    writer.write(_socks5_reply(0x08))  # address type not supported
+                else:
+                    writer.write(_socks5_reply(0x05))
                 await writer.drain()
                 writer.close()
                 return
@@ -915,6 +1024,7 @@ async def _run(port: int, dc_opt: Dict[int, Optional[str]],
     for dc in dc_opt.keys():
         log.info("    DC%d: %s", dc, dc_opt.get(dc))
     log.info("  Max connections: %d", MAX_CONNECTIONS)
+    log.info("  IPv6 mode: %s (cooldown %ds)", IPV6_MODE, int(IPV6_COOLDOWN))
     log.info("=" * 60)
     log.info("  Configure Telegram Desktop:")
     if SOCKS5_AUTH_ENABLED:
@@ -1004,13 +1114,17 @@ def main():
                     default=[
                         "1:149.154.175.50", "1:149.154.175.51", "1:149.154.175.54",
                         "2:149.154.167.41", "2:149.154.167.50", "2:149.154.167.51",
-                        "2:149.154.167.220", "2:149.154.167.222",
+                        "2:149.154.167.151", "2:149.154.167.220", "2:149.154.167.222",
                         "3:149.154.175.100", "3:149.154.175.101",
                         "4:149.154.167.91", "4:149.154.167.92", "4:149.154.164.250",
                         "5:91.108.56.100", "5:91.108.56.101", "5:91.108.56.103",
                         "5:91.108.56.116", "5:91.108.56.126"
                     ],
                     help='Target IP for DC, e.g. --dc-ip 2:149.154.167.220')
+    ap.add_argument('--ipv6', choices=['auto', 'on', 'off'], default='auto',
+                    help='IPv6 handling: auto (disable on errors), on, off')
+    ap.add_argument('--ipv6-cooldown', type=int, default=int(IPV6_COOLDOWN),
+                    help='Seconds to disable IPv6 after failure (auto mode)')
     ap.add_argument('-v', '--verbose', action='store_true',
                     help='Debug logging')
     args = ap.parse_args()
@@ -1019,6 +1133,11 @@ def main():
     if args.host not in ('127.0.0.1', '::1', 'localhost'):
         print(f"WARNING: Proxy will be accessible on {args.host} — "
               "make sure this is intentional!", file=sys.stderr)
+
+    global IPV6_MODE, IPV6_COOLDOWN, _ipv6_disabled_until
+    IPV6_MODE = args.ipv6
+    IPV6_COOLDOWN = max(10.0, float(args.ipv6_cooldown))
+    _ipv6_disabled_until = 0.0
 
     try:
         dc_opt = parse_dc_ip_list(args.dc_ip)
