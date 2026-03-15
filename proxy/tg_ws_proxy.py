@@ -127,9 +127,9 @@ class RawWebSocket:
     """
     Lightweight WebSocket client over asyncio reader/writer streams.
 
-    Connects directly to a target IP via TCP+TLS (bypassing any system
-    proxy), performs the HTTP Upgrade handshake, and provides send/recv
-    for binary frames with masking, ping/pong, and close handling.
+    Connects to a target IP or domain via TCP+TLS, performs the HTTP
+    Upgrade handshake, and provides send/recv for binary frames with
+    masking, ping/pong, and close handling.
     """
 
     OP_CONTINUATION = 0x0
@@ -146,19 +146,11 @@ class RawWebSocket:
         self._closed  = False
 
     @staticmethod
-    async def connect(ip: str, domain: str, path: str = '/apiws',
-                      timeout: float = 10.0) -> 'RawWebSocket':
-        """
-        Connect via TLS to ip:443, send SNI=domain,
-        perform WebSocket upgrade, return RawWebSocket.
-        Raises WsHandshakeError on non-101 response.
-        """
-        # FIX-1: server_hostname=domain → TLS верифицирует сертификат domain
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, 443, ssl=_ssl_ctx,
-                                    server_hostname=domain),
-            timeout=min(timeout, 10))
-
+    async def _handshake(reader: asyncio.StreamReader,
+                         writer: asyncio.StreamWriter,
+                         domain: str,
+                         path: str,
+                         timeout: float) -> 'RawWebSocket':
         ws_key = base64.b64encode(os.urandom(16)).decode()
         req = (
             f'GET {path} HTTP/1.1\r\n'
@@ -213,6 +205,34 @@ class RawWebSocket:
         writer.close()
         raise WsHandshakeError(status_code, first_line, headers,
                                 location=headers.get('location'))
+
+    @staticmethod
+    async def connect_ip(ip: str, domain: str, path: str = '/apiws',
+                         timeout: float = 10.0) -> 'RawWebSocket':
+        """
+        Connect via TLS to ip:443, send SNI=domain,
+        perform WebSocket upgrade, return RawWebSocket.
+        Raises WsHandshakeError on non-101 response.
+        """
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, 443, ssl=_ssl_ctx,
+                                    server_hostname=domain),
+            timeout=min(timeout, 10))
+        return await RawWebSocket._handshake(reader, writer, domain,
+                                             path, timeout)
+
+    @staticmethod
+    async def connect_domain(domain: str, path: str = '/apiws',
+                             timeout: float = 10.0) -> 'RawWebSocket':
+        """
+        Connect via TLS to domain:443 (DNS + SNI),
+        perform WebSocket upgrade, return RawWebSocket.
+        Raises WsHandshakeError on non-101 response.
+        """
+        reader, writer = await _open_tls_connection_with_policy(
+            domain, 443, timeout=min(timeout, 10))
+        return await RawWebSocket._handshake(reader, writer, domain,
+                                             path, timeout)
 
     async def send(self, data: bytes):
         """Send a masked binary WebSocket frame."""
@@ -388,6 +408,19 @@ def _mark_ipv6_failure(exc: BaseException) -> None:
                     int(IPV6_COOLDOWN))
 
 
+def _is_tls_error(exc: BaseException) -> bool:
+    if isinstance(exc, ssl.SSLError):
+        return True
+    err = str(exc)
+    return any(token in err for token in (
+        "RECORD_LAYER_FAILURE",
+        "WRONG_VERSION_NUMBER",
+        "TLSV1_ALERT",
+        "CERTIFICATE_VERIFY_FAILED",
+        "Hostname mismatch",
+    ))
+
+
 async def _open_connection_with_policy(host: str, port: int,
                                        timeout: float = 10.0):
     """Resolve and connect honoring IPv6 policy. Returns (reader, writer)."""
@@ -430,6 +463,41 @@ async def _open_connection_with_policy(host: str, port: int,
         try:
             return await asyncio.wait_for(
                 asyncio.open_connection(sockaddr[0], sockaddr[1],
+                                        family=family),
+                timeout=timeout)
+        except Exception as exc:
+            last_exc = exc
+            if family == _socket.AF_INET6:
+                _mark_ipv6_failure(exc)
+            continue
+
+    if last_exc:
+        raise last_exc
+    raise OSError("No resolved addresses")
+
+
+async def _open_tls_connection_with_policy(domain: str, port: int,
+                                           timeout: float = 10.0):
+    """Resolve domain and connect via TLS honoring IPv6 policy."""
+    allow_ipv6 = _ipv6_allowed()
+    infos = await asyncio.get_event_loop().getaddrinfo(
+        domain, port, type=_socket.SOCK_STREAM, family=_socket.AF_UNSPEC)
+    addrs = []
+    for family, socktype, proto, _canon, sockaddr in infos:
+        if family == _socket.AF_INET6 and not allow_ipv6:
+            continue
+        addrs.append((family, socktype, proto, sockaddr))
+
+    if allow_ipv6:
+        addrs.sort(key=lambda x: 0 if x[0] == _socket.AF_INET6 else 1)
+
+    last_exc = None
+    for family, _socktype, _proto, sockaddr in addrs:
+        try:
+            return await asyncio.wait_for(
+                asyncio.open_connection(sockaddr[0], sockaddr[1],
+                                        ssl=_ssl_ctx,
+                                        server_hostname=domain,
                                         family=family),
                 timeout=timeout)
         except Exception as exc:
@@ -923,10 +991,26 @@ async def _handle_client(reader, writer):
 
         for domain in domains:
             url = f'wss://{domain}/apiws'
+            via = target or "DNS"
             log.info("[%s] DC%d%s (%s:%d) -> %s via %s",
-                     label, dc, media_tag, dst, port, url, target)
+                     label, dc, media_tag, dst, port, url, via)
             try:
-                ws = await RawWebSocket.connect(target, domain, timeout=10)
+                if target:
+                    try:
+                        ws = await RawWebSocket.connect_ip(
+                            target, domain, timeout=10)
+                    except Exception as exc:
+                        if _is_tls_error(exc):
+                            all_redirects = False
+                            log.warning("[%s] DC%d%s TLS error via %s, retry via DNS: %s",
+                                        label, dc, media_tag, target, exc)
+                            ws = await RawWebSocket.connect_domain(
+                                domain, timeout=10)
+                        else:
+                            raise
+                else:
+                    ws = await RawWebSocket.connect_domain(
+                        domain, timeout=10)
                 all_redirects = False
                 break
             except WsHandshakeError as exc:
