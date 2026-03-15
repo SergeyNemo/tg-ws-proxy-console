@@ -25,6 +25,8 @@ cp config.example.json config.json
     "2:149.154.167.220",
     ...
   ],
+  "ipv6_mode": "auto",
+  "ipv6_cooldown": 10,
   "verbose": false
 }
 ```
@@ -38,6 +40,8 @@ cp config.example.json config.json
 | `username` | string | — | SOCKS5 username (любой) |
 | `password` | string | — | SOCKS5 password (установите сильный!) |
 | `dc_ip` | array | — | Telegram DataCenter IP адреса |
+| `ipv6_mode` | string | auto | IPv6 режим: `auto`, `on`, `off` |
+| `ipv6_cooldown` | int | 10 | Время (сек) отключения IPv6 в режиме `auto` |
 | `verbose` | boolean | false | DEBUG логирование |
 
 ## host значения
@@ -75,7 +79,7 @@ cp config.example.json config.json
   "dc_ip": [
     "1:149.154.175.50", "1:149.154.175.51", "1:149.154.175.54",
     "2:149.154.167.41", "2:149.154.167.50", "2:149.154.167.51",
-    "2:149.154.167.220", "2:149.154.167.222",
+    "2:149.154.167.151", "2:149.154.167.220", "2:149.154.167.222",
     "3:149.154.175.100", "3:149.154.175.101",
     "4:149.154.167.91", "4:149.154.167.92", "4:149.154.164.250",
     "5:91.108.56.100", "5:91.108.56.101", "5:91.108.56.103",
