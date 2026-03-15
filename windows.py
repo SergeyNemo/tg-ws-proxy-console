@@ -46,12 +46,14 @@ DEFAULT_CONFIG = {
     "dc_ip": [
         "1:149.154.175.50", "1:149.154.175.51", "1:149.154.175.54",
         "2:149.154.167.41", "2:149.154.167.50", "2:149.154.167.51",
-        "2:149.154.167.220", "2:149.154.167.222",
+        "2:149.154.167.151", "2:149.154.167.220", "2:149.154.167.222",
         "3:149.154.175.100", "3:149.154.175.101",
         "4:149.154.167.91", "4:149.154.167.92", "4:149.154.164.250",
         "5:91.108.56.100", "5:91.108.56.101", "5:91.108.56.103",
         "5:91.108.56.116", "5:91.108.56.126"
     ],
+    "ipv6_mode": "auto",
+    "ipv6_cooldown": 10,
     "verbose": False,
 }
 
@@ -137,12 +139,27 @@ async def run_proxy(config: Dict[str, Any]) -> None:
     password = config.get("password", "")
     dc_ip = config.get("dc_ip", [])
     verbose = config.get("verbose", False)
-    
+    ipv6_mode = str(config.get("ipv6_mode", "auto")).lower()
+    ipv6_cooldown = config.get("ipv6_cooldown", 300)
+
     # Передаём аутентификацию в tg_ws_proxy через глобальные переменные
     tg_ws_proxy.SOCKS5_USERNAME = username
     tg_ws_proxy.SOCKS5_PASSWORD = password
     tg_ws_proxy.SOCKS5_AUTH_ENABLED = bool(password)
-    
+
+    if ipv6_mode not in ("auto", "on", "off"):
+        log.error("Invalid ipv6_mode '%s' (use auto/on/off)", ipv6_mode)
+        sys.exit(1)
+    try:
+        ipv6_cooldown = max(10.0, float(ipv6_cooldown))
+    except (TypeError, ValueError):
+        log.error("Invalid ipv6_cooldown '%s' (seconds)", ipv6_cooldown)
+        sys.exit(1)
+
+    tg_ws_proxy.IPV6_MODE = ipv6_mode
+    tg_ws_proxy.IPV6_COOLDOWN = ipv6_cooldown
+    tg_ws_proxy._ipv6_disabled_until = 0.0
+
     # Распарсим список DC-адресов
     try:
         dc_opt = tg_ws_proxy.parse_dc_ip_list(dc_ip)
@@ -160,8 +177,9 @@ async def run_proxy(config: Dict[str, Any]) -> None:
         
         if dc_ip:
             log.info(f"DC addresses: {len(dc_opt)} DataCenters configured")
-        
+
         log.info(f"Verbose logging: {'ON' if verbose else 'OFF'}")
+        log.info(f"IPv6 mode: {ipv6_mode} (cooldown {int(ipv6_cooldown)}s)")
         log.info("Proxy is running. Press Ctrl+C to stop.\n")
         
         # Используем встроенную функцию запуска прокси
