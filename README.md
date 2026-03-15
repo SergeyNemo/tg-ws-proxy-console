@@ -62,6 +62,7 @@ python proxy/tg_ws_proxy.py --port 1080 -v
     "2:149.154.167.41",
     "2:149.154.167.50",
     "2:149.154.167.51",
+    "2:149.154.167.151",
     "2:149.154.167.220",
     "2:149.154.167.222",
     "3:149.154.175.100",
@@ -75,6 +76,8 @@ python proxy/tg_ws_proxy.py --port 1080 -v
     "5:91.108.56.116",
     "5:91.108.56.126"
   ],
+  "ipv6_mode": "auto",
+  "ipv6_cooldown": 10,
   "verbose": false
 }
 ```
@@ -84,6 +87,8 @@ python proxy/tg_ws_proxy.py --port 1080 -v
 - `host` — интерфейс слушания (`127.0.0.1` только локально)
 - `username` / `password` — SOCKS5 аутентификация
 - `dc_ip` — список Telegram DataCenter адресов
+- `ipv6_mode` — режим IPv6: `auto` (отключает при ошибках), `on`, `off`
+- `ipv6_cooldown` — время (сек) отключения IPv6 в режиме `auto`
 - `verbose` — включить DEBUG логирование
 
 **Примечание (DC203 / CDN):** Иногда в логах можно увидеть `unknown DC203 ... -> TCP passthrough`.  
