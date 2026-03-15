@@ -1102,6 +1102,7 @@ def run_proxy(port: int, dc_opt: Dict[int, str],
 
 
 def main():
+    global IPV6_MODE, IPV6_COOLDOWN, _ipv6_disabled_until
     ap = argparse.ArgumentParser(
         description='Telegram Desktop WebSocket Bridge Proxy — Secure Edition')
     ap.add_argument('--port', type=int, default=DEFAULT_PORT,
@@ -1134,7 +1135,6 @@ def main():
         print(f"WARNING: Proxy will be accessible on {args.host} — "
               "make sure this is intentional!", file=sys.stderr)
 
-    global IPV6_MODE, IPV6_COOLDOWN, _ipv6_disabled_until
     IPV6_MODE = args.ipv6
     IPV6_COOLDOWN = max(10.0, float(args.ipv6_cooldown))
     _ipv6_disabled_until = 0.0
