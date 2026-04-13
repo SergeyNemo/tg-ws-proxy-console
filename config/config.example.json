@@ -8,5 +8,11 @@
     "4:149.154.167.92",
     "203:149.154.167.220"
   ],
+  "cfproxy_enabled": false,
+  "cfproxy_priority": false,
+  "cfproxy_auto_refresh": false,
+  "cfproxy_domains": [],
+  "buf_kb": 256,
+  "pool_size": 4,
   "verbose": false
 }
