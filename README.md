@@ -1,125 +1,87 @@
-# TG WS Proxy — безопасная версия
+# TG WS Proxy (Console)
 
-SOCKS5-прокси для Telegram Desktop через WebSocket/TLS с исправленными уязвимостями безопасности.
+Локальный SOCKS5-прокси для Telegram Desktop.  
+Нужен, чтобы Telegram работал стабильнее в сетях с ограничениями.
 
-**Авторство**
+## Быстрый старт
 
-**Оригинальный проект:** [tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) от [Flowseal](https://github.com/Flowseal) (MIT)  
-**Форк & Исправления:** [Sergey Nemo](https://github.com/SergeyNemo) (2026)
-
-Детали всех изменений в [CHANGES.md](./CHANGES.md).
-
----
-
-## 🚀 Быстрый старт
-
-### Требования
-
-- Python 3.8+
-- Windows / Linux / macOS
-
-### Установка
-
+1. Установите зависимости:
 ```bash
-git clone https://github.com/SergeyNemo/tg-ws-proxy-console
-cd tg-ws-proxy-console
 pip install -r requirements.txt
-
-# Скопируйте пример конфига и заполните свои данные
-cp config/config.example.json config/config.json
 ```
 
-Отредактируйте `config/config.json` с вашими параметрами.
+2. Создайте `config/config.json` (можно взять `config/config.example.json`).
 
-### Запуск (консольный режим)
-
+3. Запустите:
 ```bash
 python windows.py
 ```
 
-### Запуск (прокси-сервер только)
-
-```bash
-python proxy/tg_ws_proxy.py --port 1080 -v
-```
-
----
-
-## ⚙️ Конфигурация
-
-**Файл:** `config/config.json`
+## Пример простого конфига
 
 ```json
 {
   "port": 1080,
   "host": "127.0.0.1",
-  "username": "telegram",
-  "password": "your_strong_password_here",
+  "username": "username",
+  "password": "your_password_here",
   "dc_ip": [
-    "1:149.154.175.50",
     "2:149.154.167.220",
-    "3:149.154.175.100",
-    "4:149.154.167.91",
-    "5:91.108.56.100"
+    "4:149.154.167.92",
+    "203:149.154.167.220"
   ],
+  "cfproxy_enabled": false,
+  "cfproxy_priority": false,
+  "cfproxy_auto_refresh": false,
+  "cfproxy_domains": [],
+  "buf_kb": 256,
+  "pool_size": 4,
   "verbose": false
 }
 ```
 
-**Параметры:**
-- `port` — SOCKS5 порт (по умолчанию 1080)
-- `host` — интерфейс слушания (`127.0.0.1` только локально)
-- `username` / `password` — SOCKS5 аутентификация
-- `dc_ip` — список Telegram DataCenter адресов
-- `verbose` — включить DEBUG логирование
+## Если В Группах Не Грузятся Медиа
 
----
+По умолчанию CF-режим выключен.  
+Если фото/видео в группах не открываются, включите CF fallback:
 
-## 📊 Логирование
-
-**Файл:** `logs/proxy.log`
-
-Автоматическая ротация:
-- Размер: 10 МБ на файл
-- Хранит: 3 последних файла
-- Максимум: 40 МБ на диске
-
-Пример:
-```
-2026-03-11 15:40:14 [INFO] stats: total=42 ws=15 tcp_fb=27 pass=0 err=0 up=15.3MB down=42.1MB
-```
-
----
-
-## 🛡️ Безопасность
-
-**Для локального использования (рекомендуется):**
 ```json
-{ "host": "127.0.0.1" }
+"cfproxy_enabled": true,
+"cfproxy_priority": true,
+"cfproxy_auto_refresh": true,
+"cfproxy_domains": []
 ```
-- Доступен только с текущей машины
-- Не требует дополнительной защиты
 
-**Для сетевого доступа:**
-- Используйте только в доверенной сети (LAN, VPN)
-- Сильный пароль: 12+ символов, спецсимволы
-- Firewall ограничение: `netsh advfirewall firewall add rule name="TG-SOCKS5" dir=in action=allow protocol=tcp localport=1080 remoteip=192.168.1.0/24`
-- Защита файла: `icacls "config\config.json" /inheritance:r /grant:r "%USERNAME%:F"`
+Если позже появится свой домен, лучше использовать его:
 
-**Детально:** смотрите [CHANGES.md](./CHANGES.md)
+```json
+"cfproxy_enabled": true,
+"cfproxy_priority": true,
+"cfproxy_auto_refresh": false,
+"cfproxy_domains": ["your-domain.com"]
+```
 
----
+Настройки можно посмотреть у автора в файле: https://github.com/Flowseal/tg-ws-proxy/blob/main/docs/CfProxy.md
 
-## � Авторство
+## Главное по параметрам
 
-**Оригинальный проект:** [Flowseal](https://github.com/Flowseal/tg-ws-proxy) — MIT License
+- `host`: для безопасного локального режима оставляйте `127.0.0.1`.
+- `dc_ip`: рабочие DC-адреса для проксирования Telegram.
+- `cfproxy_enabled`: включает fallback через Cloudflare-домены.
+- `cfproxy_priority`: если `true`, сначала пробуется CF, потом обычный путь.
+- `cfproxy_domains`: если заполнен, используются только эти домены.
+- `cfproxy_auto_refresh`: автообновление CF-списка (когда `cfproxy_domains` пуст).
+- `buf_kb`, `pool_size`: параметры производительности.
 
-**Исправления безопасности:** [Sergey Nemo](https://github.com/SergeyNemo) (2026)
+## Что улучшено по безопасности (относительно оригинала)
 
-Детали изменений в [CHANGES.md](./CHANGES.md)
+- Включена строгая проверка TLS-сертификатов.
+- Ограничен максимальный размер WS-фрейма (защита от перегрузки памяти).
+- Из debug-логов убраны чувствительные криптоданные.
+- Есть ограничение числа одновременных подключений.
+- Есть предупреждение при небезопасном `host` (например, `0.0.0.0`).
 
----
+## Важно
 
-## 📄 Лицензия
-
-MIT License — смотрите [LICENSE](./LICENSE) для полного текста.
+- Проект основан на [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) (MIT).
+- Этот форк ориентирован на практичность и безопасность для повседневного использования.
