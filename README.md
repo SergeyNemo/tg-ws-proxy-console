@@ -84,4 +84,3 @@ python windows.py
 ## Важно
 
 - Проект основан на [Flowseal/tg-ws-proxy](https://github.com/Flowseal/tg-ws-proxy) (MIT).
-- Этот форк ориентирован на практичность и безопасность для повседневного использования.
