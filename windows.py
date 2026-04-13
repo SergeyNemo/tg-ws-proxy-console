@@ -44,13 +44,16 @@ DEFAULT_CONFIG = {
     "username": "telegram",
     "password": "your_password_here",
     "dc_ip": [
-        "1:149.154.175.50", "1:149.154.175.51", "1:149.154.175.54",
-        "2:149.154.167.41", "2:149.154.167.50", "2:149.154.167.51",
-        "2:149.154.167.151", "2:149.154.167.223", "2:149.154.167.220",
-        "3:149.154.175.100", "3:149.154.175.101",
-        "4:149.154.167.91", "4:149.154.167.92",
-        "5:91.108.56.100", "5:91.108.56.101", "5:91.108.56.116", "5:91.108.56.126"
+        "2:149.154.167.220",
+        "4:149.154.167.92",
+        "203:149.154.167.220"
     ],
+    "cfproxy_enabled": False,
+    "cfproxy_priority": False,
+    "cfproxy_auto_refresh": True,
+    "cfproxy_domains": [],
+    "buf_kb": 256,
+    "pool_size": 4,
     "verbose": False,
 }
 
@@ -135,12 +138,40 @@ async def run_proxy(config: Dict[str, Any]) -> None:
     username = config.get("username", "telegram")
     password = config.get("password", "")
     dc_ip = config.get("dc_ip", [])
+    cfproxy_enabled = bool(config.get("cfproxy_enabled", False))
+    cfproxy_priority = bool(config.get("cfproxy_priority", False))
+    cfproxy_auto_refresh = bool(config.get("cfproxy_auto_refresh", True))
+    cfproxy_domains = config.get("cfproxy_domains", [])
+    buf_kb = config.get("buf_kb", 256)
+    pool_size = config.get("pool_size", 4)
     verbose = config.get("verbose", False)
+
+    if not isinstance(dc_ip, list):
+        log.error("Invalid config: 'dc_ip' must be a list")
+        sys.exit(1)
+    if not isinstance(cfproxy_domains, list):
+        log.error("Invalid config: 'cfproxy_domains' must be a list")
+        sys.exit(1)
+    if not isinstance(buf_kb, int):
+        log.error("Invalid config: 'buf_kb' must be an integer")
+        sys.exit(1)
+    if not isinstance(pool_size, int):
+        log.error("Invalid config: 'pool_size' must be an integer")
+        sys.exit(1)
+    cfproxy_domains = [d.strip().lower() for d in cfproxy_domains
+                       if isinstance(d, str) and d.strip()]
     
     # Передаём аутентификацию в tg_ws_proxy через глобальные переменные
     tg_ws_proxy.SOCKS5_USERNAME = username
     tg_ws_proxy.SOCKS5_PASSWORD = password
     tg_ws_proxy.SOCKS5_AUTH_ENABLED = bool(password)
+    tg_ws_proxy.CFPROXY_ENABLED = bool(cfproxy_enabled)
+    tg_ws_proxy.CFPROXY_PRIORITY = bool(cfproxy_priority)
+    tg_ws_proxy.CFPROXY_DOMAINS = cfproxy_domains
+    tg_ws_proxy.CFPROXY_CUSTOM_DOMAINS = bool(cfproxy_domains)
+    tg_ws_proxy.CFPROXY_AUTO_REFRESH = bool(cfproxy_auto_refresh)
+    tg_ws_proxy.SOCKET_BUFFER_SIZE = max(4, int(buf_kb)) * 1024
+    tg_ws_proxy.WS_POOL_SIZE = max(0, int(pool_size))
     
     # Распарсим список DC-адресов
     try:
@@ -159,6 +190,12 @@ async def run_proxy(config: Dict[str, Any]) -> None:
         
         if dc_ip:
             log.info(f"DC addresses: {len(dc_opt)} DataCenters configured")
+        if tg_ws_proxy.CFPROXY_ENABLED:
+            order = "CF-first" if tg_ws_proxy.CFPROXY_PRIORITY else "direct-first"
+            mode = ("custom-domains" if tg_ws_proxy.CFPROXY_CUSTOM_DOMAINS
+                    else ("auto-refresh" if tg_ws_proxy.CFPROXY_AUTO_REFRESH else "default-pool"))
+            log.info(f"CF proxy enabled: {order}, mode={mode}")
+        log.info(f"Performance: buf_kb={max(4, int(buf_kb))}, pool_size={max(0, int(pool_size))}")
         
         log.info(f"Verbose logging: {'ON' if verbose else 'OFF'}")
         log.info("Proxy is running. Press Ctrl+C to stop.\n")
