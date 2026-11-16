@@ -1,0 +1,22 @@
+# Кэши Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Сборка PyInstaller
+build/
+dist/
+dist/windows.exe
+*.spec.bak
+
+# Логи и конфиг
+logs/
+config/config.json
+
+# Заметки о правках
+CHANGES.md
+
+# Временные файлы
+.ruff_cache/
+.venv/
+venv/

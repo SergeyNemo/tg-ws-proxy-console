@@ -17,9 +17,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import http.client
 import logging
 import os
 import random
+import re
 import socket as _socket
 import ssl
 import string
@@ -29,8 +31,10 @@ import threading
 import time
 from collections import deque
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.request import Request, urlopen
+from urllib.request import HTTPSHandler, Request, build_opener
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+import certifi
 
 
 DEFAULT_PORT      = 1080
@@ -112,6 +116,10 @@ CFPROXY_DOMAINS: List[str] = []
 CFPROXY_CUSTOM_DOMAINS: bool = False
 CFPROXY_AUTO_REFRESH: bool = True
 CFPROXY_ACTIVE_DOMAIN: str = ""
+# SNI для CF-пути: если DPI блокирует kwsN.<domain>, шлём apex-домен.
+# 'sub' = всегда реальный SNI, 'apex' = всегда apex, 'auto' = SNI домена,
+# затем apex-запас (по умолчанию).
+CFPROXY_SNI_MODE: str = "auto"
 CFPROXY_DOMAINS_URL = (
     "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main"
     "/.github/cfproxy-domains.txt"
@@ -128,11 +136,117 @@ WS_POOL_SIZE: int = DEFAULT_POOL_SIZE
 
 _cfproxy_refresh_stop: threading.Event = threading.Event()
 
-# FIX-1: TLS с полной верификацией — check_hostname=True, verify_mode=CERT_REQUIRED
-_ssl_ctx = ssl.create_default_context()
-# Значения по умолчанию уже безопасны; явно НЕ отключаем их:
-#   _ssl_ctx.check_hostname = True   (default)
-#   _ssl_ctx.verify_mode   = ssl.CERT_REQUIRED  (default)
+# Per-host connect backoff: host -> monotonic deadline until which it is skipped
+_host_cooldown_until: Dict[str, float] = {}
+_host_fail_counts: Dict[str, int] = {}
+HOST_COOLDOWN_INITIAL = 30.0
+HOST_COOLDOWN_MAX = 600.0
+
+# Сколько CF-хостов пробовать на один клиентский запрос (защита от лавины)
+CF_MAX_ATTEMPTS_PER_REQUEST = 6
+
+# DC, для которых direct-WS через kwsN.web.telegram.org невозможен:
+# сервер на этом IP не отдаёт сертификат на это имя (hostname mismatch).
+# Заполняется автоматически при первой такой ошибке, чтобы не спамить.
+_dc_direct_unavailable: Set[int] = set()
+
+
+def _dc_direct_disabled(dc: int) -> bool:
+    return dc in _dc_direct_unavailable
+
+
+def _mark_dc_direct_unavailable(dc: int, reason: str) -> None:
+    if dc in _dc_direct_unavailable:
+        return
+    _dc_direct_unavailable.add(dc)
+    log.info("DC%d: direct WS via kws%d.web.telegram.org unavailable (%s); "
+             "routing through CF proxy only", dc, dc, reason)
+
+# TCP fallback backoff: (dst, port) -> состояние
+_tcp_connecting: Set[Tuple[str, int]] = set()
+_tcp_failures: Dict[Tuple[str, int], int] = {}
+_tcp_retry_after: Dict[Tuple[str, int], float] = {}
+TCP_BACKOFF_INITIAL = 2.0
+TCP_BACKOFF_MAX = 300.0
+
+
+def _create_ssl_context(*, check_hostname: bool = True) -> ssl.SSLContext:
+    # FIX-1: TLS с полной верификацией — check_hostname=True, verify_mode=CERT_REQUIRED
+    bundle_dir = getattr(sys, '_MEIPASS', None)
+    cafile = (os.path.join(bundle_dir, 'certifi', 'cacert.pem')
+              if bundle_dir else certifi.where())
+    context = ssl.create_default_context(cafile=cafile)
+    if bundle_dir:
+        context.load_default_certs()
+    # Понижаем приоритет X25519MLKEM768 (большой ClientHello триггерит DPI),
+    # оставляя классический X25519 основным для TLS 1.3.
+    try:
+        context.set_ecdh_curve('X25519')
+    except Exception:
+        pass
+    context.check_hostname = check_hostname
+    return context
+
+
+_ssl_ctx = _create_ssl_context()
+
+_GITHUB_IPS: Dict[str, str] = {
+    "release-assets.githubusercontent.com": "185.199.109.133",
+    "raw.githubusercontent.com": "185.199.109.133",
+}
+
+
+class _PinnedHTTPSHandler(HTTPSHandler):
+    def https_open(self, req):
+        host = req.host.split(":")[0]
+        pinned = _GITHUB_IPS.get(host)
+        if not pinned:
+            return super().https_open(req)
+        context = _ssl_ctx
+
+        class _Conn(http.client.HTTPSConnection):
+            def connect(self):
+                self.sock = _socket.create_connection(
+                    (pinned, self.port or 443), self.timeout, self.source_address)
+                if self._tunnel_host:
+                    self._tunnel()
+                self.sock = context.wrap_socket(
+                    self.sock, server_hostname=self._tunnel_host or self.host)
+
+        try:
+            return self.do_open(_Conn, req, context=context)
+        except Exception:
+            return super().https_open(req)
+
+
+def _build_github_opener():
+    return build_opener(_PinnedHTTPSHandler())
+
+
+class DomainCensorFilter(logging.Filter):
+    domain_pattern = re.compile(
+        r'(?<![\w-])(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+'
+        r'[a-zA-Z]{2,}(?![\w-])')
+
+    def _censor_match(self, match):
+        domain = match.group()
+        normalized = domain.casefold().rstrip('.')
+        if (normalized == 'telegram.org' or normalized.endswith('.telegram.org')
+                or normalized.endswith('.log')):
+            return domain
+        parts = domain.split('.')
+        if len(parts) < 2:
+            return domain
+        return '.'.join(
+            part if i == len(parts) - 1 else
+            part[:len(part) // 2] + '*' * (len(part) - len(part) // 2)
+            for i, part in enumerate(parts))
+
+    def filter(self, record):
+        record.msg = self.domain_pattern.sub(self._censor_match, record.getMessage())
+        record.args = ()
+        return True
+
 
 
 class WsHandshakeError(Exception):
@@ -174,13 +288,48 @@ def _decode_cf_domain(encoded: str) -> str:
 
 CFPROXY_DEFAULT_DOMAINS: List[str] = [_decode_cf_domain(d) for d in _CFPROXY_ENC]
 
+_CFPROXY_MIN_VALID_DOMAINS = 3
+
+
+def _is_valid_domain(domain: str) -> bool:
+    if not domain or len(domain) > 253:
+        return False
+    if domain.startswith('.') or domain.endswith('.'):
+        return False
+    labels = domain.split('.')
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not label or len(label) > 63:
+            return False
+        if label[0] == '-' or label[-1] == '-':
+            return False
+        if not all(ch.isalnum() or ch == '-' for ch in label):
+            return False
+    tld = labels[-1]
+    if len(tld) < 2 or not any(ch.isalpha() for ch in tld):
+        return False
+    return True
+
+
+def _normalize_domain_pool(domains: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    normalized: List[str] = []
+    for domain in domains:
+        item = domain.strip().lower()
+        if not _is_valid_domain(item) or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized
+
 
 def _fetch_cfproxy_domain_list() -> List[str]:
     try:
         suffix = "".join(random.choices(string.ascii_letters, k=7))
         req = Request(f"{CFPROXY_DOMAINS_URL}?{suffix}",
                       headers={'User-Agent': 'tg-ws-proxy'})
-        with urlopen(req, timeout=10) as resp:
+        with _build_github_opener().open(req, timeout=10) as resp:
             text = resp.read().decode('utf-8', errors='replace')
         encoded = [
             line.strip() for line in text.splitlines()
@@ -195,18 +344,27 @@ def _fetch_cfproxy_domain_list() -> List[str]:
 def refresh_cfproxy_domains() -> None:
     global CFPROXY_DOMAINS, CFPROXY_ACTIVE_DOMAIN
     fetched = _fetch_cfproxy_domain_list()
+    pool = _normalize_domain_pool(fetched)
 
-    if fetched:
-        seen: Set[str] = set()
-        pool = [d for d in fetched if not (d in seen or seen.add(d))]
+    if len(pool) >= _CFPROXY_MIN_VALID_DOMAINS:
+        CFPROXY_DOMAINS = pool
         log.info("CF proxy domain pool updated from GitHub (%d domains)",
                  len(pool))
+    elif fetched:
+        log.warning(
+            "Ignoring fetched CF proxy domains due to low-quality payload "
+            "(total=%d, valid=%d, required>=%d); keeping current pool",
+            len(fetched), len(pool), _CFPROXY_MIN_VALID_DOMAINS)
+        if not CFPROXY_DOMAINS:
+            CFPROXY_DOMAINS = list(CFPROXY_DEFAULT_DOMAINS)
     else:
-        pool = list(CFPROXY_DOMAINS) or list(CFPROXY_DEFAULT_DOMAINS)
+        log.warning("CF proxy domain refresh failed or empty response; "
+                    "keeping current pool")
+        if not CFPROXY_DOMAINS:
+            CFPROXY_DOMAINS = list(CFPROXY_DEFAULT_DOMAINS)
 
-    CFPROXY_DOMAINS = pool
-    if pool:
-        CFPROXY_ACTIVE_DOMAIN = random.choice(pool)
+    if CFPROXY_DOMAINS and not CFPROXY_ACTIVE_DOMAIN:
+        CFPROXY_ACTIVE_DOMAIN = random.choice(CFPROXY_DOMAINS)
 
 
 def stop_cfproxy_domain_refresh() -> None:
@@ -270,17 +428,20 @@ class RawWebSocket:
 
     @staticmethod
     async def connect(ip: str, domain: str, path: str = '/apiws',
-                      timeout: float = 10.0) -> 'RawWebSocket':
+                      timeout: float = 10.0,
+                      sni: Optional[str] = None) -> 'RawWebSocket':
         """
-        Connect via TLS to ip:443, send SNI=domain,
+        Connect via TLS to ip:443, send SNI (defaults to domain),
         perform WebSocket upgrade, return RawWebSocket.
         Raises WsHandshakeError on non-101 response.
         """
-        # FIX-1: server_hostname=domain → TLS верифицирует сертификат domain
+        # FIX-1: TLS верифицирует цепочку и hostname SNI. Для CF-пути SNI может
+        # отличаться от Host (apex-домен), проверка сертификата остаётся включённой.
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(ip, 443, ssl=_ssl_ctx,
-                                    server_hostname=domain),
+                                    server_hostname=sni or domain),
             timeout=min(timeout, 10))
+
         set_sock_opts(writer.transport, SOCKET_BUFFER_SIZE)
 
         ws_key = base64.b64encode(os.urandom(16)).decode()
@@ -474,6 +635,11 @@ def _human_bytes(n: int) -> str:
     return f"{n:.1f}TB"
 
 
+def _exc_text(exc: BaseException) -> str:
+    text = str(exc).strip()
+    return text or type(exc).__name__
+
+
 def _is_telegram_ip(ip: str) -> bool:
     try:
         n = struct.unpack('!I', _socket.inet_aton(ip))[0]
@@ -591,25 +757,35 @@ class _MsgSplitter:
 
 def _ws_domains(dc: int, is_media) -> List[str]:
     """
-    Return domain names to try for WebSocket connection to a DC.
-    DC 1-5:  kws{N}[-1].web.telegram.org
-    DC >5:   kws{N}[-1].telegram.org
+    Return domain names to try for direct Telegram WebSocket connection.
+    DC203 is served under the DC2 hostname. Both kws{N} and kws{N}-1 exist
+    under telegram.org, so the media variant is tried first.
     """
+    if dc == 203:
+        dc = 2
     base = 'telegram.org' if dc > 5 else 'web.telegram.org'
     if is_media is None or is_media:
         return [f'kws{dc}-1.{base}', f'kws{dc}.{base}']
     return [f'kws{dc}.{base}', f'kws{dc}-1.{base}']
 
 
-def _cfproxy_hosts(dc: int, is_media) -> List[str]:
+# Cloudflare proxies only serve kws{N}.<domain>; there is no kws{N}-1 variant.
+# DPI may block the exact SNI, but tolerate the apex domain, so the same host
+# is tried twice: first with its real SNI (fully verified), then with the apex
+# SNI (still verified against the *.domain wildcard certificate, Host unchanged).
+def _cfproxy_hosts(dc: int, is_media) -> List[Tuple[str, str]]:
     """
-    Build candidate CF-proxy hosts.
-    Each configured base domain becomes kws{dc}[ -1 ].<domain>.
+    Build candidate CF-proxy (host, sni) pairs.
+    Each configured base domain becomes kws{dc}.<domain>.
+
+    In 'auto' mode the apex SNI is tried first: DPI commonly filters
+    kwsN.<domain> while leaving the apex reachable. Host header stays
+    kws{dc}.<domain>, so routing is unchanged; the *.domain certificate
+    still verifies for the apex name.
     """
     if not CFPROXY_DOMAINS:
         return []
 
-    # Keep compatibility with the original behavior: DC203 uses kws2.*
     if dc == 203:
         dc = 2
 
@@ -619,36 +795,69 @@ def _cfproxy_hosts(dc: int, is_media) -> List[str]:
             d for d in ordered_domains if d != CFPROXY_ACTIVE_DOMAIN
         ]
 
-    hosts: List[str] = []
-    seen: Set[str] = set()
+    hosts: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
 
     for base in ordered_domains:
         b = (base or "").strip().lower()
         if not b:
             continue
 
+        host = f'kws{dc}.{b}'
         if b.startswith("kws"):
-            candidates = [b]
-        elif is_media is None or is_media:
-            candidates = [f'kws{dc}-1.{b}', f'kws{dc}.{b}']
+            candidates = [(b, b)]
+        elif CFPROXY_SNI_MODE == "apex":
+            candidates = [(host, b)]
+        elif CFPROXY_SNI_MODE == "sub":
+            candidates = [(host, host)]
         else:
-            candidates = [f'kws{dc}.{b}', f'kws{dc}-1.{b}']
+            candidates = [(host, b), (host, host)]
 
-        for h in candidates:
-            if h in seen:
+        for pair in candidates:
+            if pair in seen:
                 continue
-            seen.add(h)
-            hosts.append(h)
+            seen.add(pair)
+            hosts.append(pair)
 
     return hosts
 
 
+def _host_penalized(key: str) -> bool:
+    return time.monotonic() < _host_cooldown_until.get(key, 0.0)
+
+
+def report_host_failure(key: str) -> None:
+    failures = _host_fail_counts.get(key, 0) + 1
+    _host_fail_counts[key] = failures
+    delay = min(HOST_COOLDOWN_INITIAL * 2 ** min(failures - 1, 5),
+                HOST_COOLDOWN_MAX)
+    _host_cooldown_until[key] = time.monotonic() + delay
+    log.debug("Endpoint %s penalized for %.0fs (failures=%d)",
+              key, delay, failures)
+
+
+def report_host_success(key: str) -> None:
+    _host_fail_counts.pop(key, None)
+    _host_cooldown_until.pop(key, None)
+
+
+def _cleanup_expired_host_cooldowns():
+    now = time.monotonic()
+    for host in [h for h, until in _host_cooldown_until.items() if until <= now]:
+        _host_cooldown_until.pop(host, None)
+
+
+
 class _WsPool:
     WS_POOL_MAX_AGE = 120.0
+    REFILL_BACKOFF_INITIAL = 1.0
+    REFILL_BACKOFF_MAX = 300.0
 
     def __init__(self):
         self._idle: Dict[Tuple[int, bool], deque] = {}
         self._refilling: Set[Tuple[int, bool]] = set()
+        self._refill_failures: Dict[Tuple[int, bool], int] = {}
+        self._refill_after: Dict[Tuple[int, bool], float] = {}
 
     async def get(self, dc: int, is_media: bool, target_ip: str,
                   domains: List[str]) -> Optional[RawWebSocket]:
@@ -678,12 +887,17 @@ class _WsPool:
     def _schedule_refill(self, key, target_ip, domains):
         if WS_POOL_SIZE <= 0:
             return
+        if _dc_direct_disabled(key[0]):
+            return
         if key in self._refilling:
+            return
+        if time.monotonic() < self._refill_after.get(key, 0):
             return
         self._refilling.add(key)
         asyncio.create_task(self._refill(key, target_ip, domains))
 
     async def _refill(self, key, target_ip, domains):
+        dc = key[0]
         try:
             bucket = self._idle.setdefault(key, deque())
             needed = WS_POOL_SIZE - len(bucket)
@@ -691,28 +905,64 @@ class _WsPool:
                 return
             tasks = [asyncio.create_task(self._connect_one(target_ip, domains))
                      for _ in range(needed)]
+            connected = 0
+            cert_mismatch = False
             for t in tasks:
                 try:
                     ws = await t
                     if ws:
                         bucket.append((ws, time.monotonic()))
+                        connected += 1
+                except ssl.SSLCertVerificationError:
+                    cert_mismatch = True
                 except Exception:
                     pass
+            if connected:
+                self._refill_failures.pop(key, None)
+                self._refill_after.pop(key, None)
+                return
+            # Ни один домен не поднялся. Если direct-WS для этого DC
+            # невозможен (сертификат не совпадает с kwsN.*), пул бессмыслен:
+            # уходим в долгий backoff, чтобы не спамить лог.
+            if cert_mismatch or _dc_direct_disabled(dc):
+                if cert_mismatch:
+                    _mark_dc_direct_unavailable(
+                        dc, 'certificate hostname mismatch')
+                self._refill_after[key] = (
+                    time.monotonic() + self.REFILL_BACKOFF_MAX)
+                return
+            failures = self._refill_failures.get(key, 0) + 1
+            self._refill_failures[key] = failures
+            delay = min(self.REFILL_BACKOFF_INITIAL * 2 ** min(failures - 1, 10),
+                        self.REFILL_BACKOFF_MAX)
+            self._refill_after[key] = time.monotonic() + delay
+            log.info("WS pool refill failed for DC%d%s, retry in %.0fs",
+                     key[0], 'm' if key[1] else '', delay)
         finally:
             self._refilling.discard(key)
 
     @staticmethod
     async def _connect_one(target_ip, domains) -> Optional[RawWebSocket]:
+        cert_error = None
         for domain in domains:
+            if _host_penalized(domain):
+                continue
             try:
-                return await RawWebSocket.connect(target_ip, domain, timeout=8)
-            except WsHandshakeError as exc:
-                if exc.is_redirect:
-                    continue
-                return None
+                ws = await RawWebSocket.connect(target_ip, domain, timeout=8)
+            except ssl.SSLCertVerificationError as exc:
+                # DC не отдаёт валидный сертификат на kwsN.web.telegram.org.
+                report_host_failure(domain)
+                cert_error = exc
+                continue
             except Exception:
-                return None
+                report_host_failure(domain)
+                continue
+            report_host_success(domain)
+            return ws
+        if cert_error is not None:
+            raise cert_error
         return None
+
 
     @staticmethod
     async def _quiet_close(ws):
@@ -726,7 +976,7 @@ class _WsPool:
             return
         prepared = 0
         for dc, targets in dc_redirects.items():
-            if not targets:
+            if not targets or _dc_direct_disabled(dc):
                 continue
             target = targets[0]
             for is_media in (False, True):
@@ -739,6 +989,8 @@ class _WsPool:
     def reset(self):
         self._idle.clear()
         self._refilling.clear()
+        self._refill_failures.clear()
+        self._refill_after.clear()
 
 
 _ws_pool = _WsPool()
@@ -750,6 +1002,10 @@ def _cleanup_expired_cooldowns():
     expired = [k for k, v in _dc_fail_until.items() if v <= now]
     for k in expired:
         del _dc_fail_until[k]
+    _cleanup_expired_host_cooldowns()
+    for key in [k for k, v in _tcp_retry_after.items() if v <= now]:
+        _tcp_retry_after.pop(key, None)
+        _tcp_failures.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -947,15 +1203,34 @@ def _socks5_reply(status: int) -> bytes:
 
 async def _tcp_fallback(reader, writer, dst, port, init, label,
                         dc=None, is_media=False) -> bool:
-    """Fall back to direct TCP to the original DC IP."""
-    try:
-        rr, rw = await asyncio.wait_for(
-            asyncio.open_connection(dst, port), timeout=10)
-        set_sock_opts(rw.transport, SOCKET_BUFFER_SIZE)
-    except Exception as exc:
-        log.warning("[%s] TCP fallback connect to %s:%d failed: %s",
-                    label, dst, port, exc)
+    """Fall back to direct TCP to the original DC IP (with per-target backoff)."""
+    key = (dst, port)
+    now = time.monotonic()
+    if key in _tcp_connecting or now < _tcp_retry_after.get(key, 0.0):
+        log.debug("[%s] TCP fallback to %s:%d skipped (backoff/connecting)",
+                  label, dst, port)
         return False
+
+    _tcp_connecting.add(key)
+    try:
+        try:
+            rr, rw = await asyncio.wait_for(
+                asyncio.open_connection(dst, port), timeout=10)
+            set_sock_opts(rw.transport, SOCKET_BUFFER_SIZE)
+        except Exception as exc:
+            failures = _tcp_failures.get(key, 0) + 1
+            _tcp_failures[key] = failures
+            delay = min(TCP_BACKOFF_INITIAL * 2 ** min(failures - 1, 7),
+                        TCP_BACKOFF_MAX)
+            _tcp_retry_after[key] = time.monotonic() + delay
+            log.warning("[%s] TCP fallback connect to %s:%d failed: %s; "
+                        "retry in %.0fs", label, dst, port,
+                        _exc_text(exc), delay)
+            return False
+        _tcp_failures.pop(key, None)
+        _tcp_retry_after.pop(key, None)
+    finally:
+        _tcp_connecting.discard(key)
 
     _stats.connections_tcp_fallback += 1
     rw.write(init)
@@ -1015,10 +1290,10 @@ async def _socks5_authenticate(reader, writer, label: str) -> bool:
             return False
     
     except (asyncio.TimeoutError, asyncio.IncompleteReadError) as e:
-        log.warning("[%s] SOCKS5 auth read failed: %s", label, e)
+        log.warning("[%s] SOCKS5 auth read failed: %s", label, _exc_text(e))
         return False
     except Exception as e:
-        log.warning("[%s] SOCKS5 auth error: %s", label, e)
+        log.warning("[%s] SOCKS5 auth error: %s", label, _exc_text(e))
         return False
 
 
@@ -1206,6 +1481,8 @@ async def _handle_client(reader, writer):
         pool_media = is_media if is_media is not None else True
 
         for method in methods:
+            if method == 'direct' and _dc_direct_disabled(dc):
+                continue
             if method == 'direct':
                 for target in targets:
                     ws = await _ws_pool.get(dc, pool_media, target, domains)
@@ -1216,11 +1493,14 @@ async def _handle_client(reader, writer):
                         break
 
                     for domain in domains:
+                        if _host_penalized(domain):
+                            continue
                         url = f'wss://{domain}/apiws'
                         log.info("[%s] DC%d%s (%s:%d) -> %s via %s",
                                  label, dc, media_tag, dst, port, url, target)
                         try:
                             ws = await RawWebSocket.connect(target, domain, timeout=10)
+                            report_host_success(domain)
                             all_redirects = False
                             break
                         except WsHandshakeError as exc:
@@ -1236,6 +1516,11 @@ async def _handle_client(reader, writer):
                                 all_redirects = False
                                 log.warning("[%s] DC%d%s WS handshake: %s",
                                             label, dc, media_tag, exc.status_line)
+                        except ssl.SSLCertVerificationError:
+                            _stats.ws_errors += 1
+                            all_redirects = False
+                            _mark_dc_direct_unavailable(
+                                dc, 'certificate hostname mismatch')
                         except Exception as exc:
                             _stats.ws_errors += 1
                             all_redirects = False
@@ -1243,20 +1528,31 @@ async def _handle_client(reader, writer):
                             if ('CERTIFICATE_VERIFY_FAILED' in err_str or
                                     'Hostname mismatch' in err_str):
                                 log.warning("[%s] DC%d%s SSL error: %s",
-                                            label, dc, media_tag, exc)
+                                            label, dc, media_tag, _exc_text(exc))
                             else:
                                 log.warning("[%s] DC%d%s WS connect failed: %s",
-                                            label, dc, media_tag, exc)
+                                            label, dc, media_tag, _exc_text(exc))
                     if ws is not None:
                         break
 
             elif method == 'cfproxy' and cf_hosts:
-                for host in cf_hosts:
+                # Ограничиваем перебор, чтобы один клиент не долбил весь пул
+                attempts_left = CF_MAX_ATTEMPTS_PER_REQUEST
+                for host, sni in cf_hosts:
+                    if attempts_left <= 0:
+                        break
+                    endpoint = host if sni == host else f'{host}|{sni}'
+                    if _host_penalized(endpoint):
+                        continue
+                    attempts_left -= 1
                     url = f'wss://{host}/apiws'
-                    log.info("[%s] DC%d%s (%s:%d) -> %s via DNS",
-                             label, dc, media_tag, dst, port, url)
+                    via = '' if sni == host else f' (SNI {sni})'
+                    log.info("[%s] DC%d%s (%s:%d) -> %s via DNS%s",
+                             label, dc, media_tag, dst, port, url, via)
                     try:
-                        ws = await RawWebSocket.connect(host, host, timeout=10)
+                        ws = await RawWebSocket.connect(host, host, timeout=10,
+                                                        sni=sni)
+                        report_host_success(endpoint)
                         ws_is_cfproxy = True
                         all_redirects = False
                         break
@@ -1270,26 +1566,25 @@ async def _handle_client(reader, writer):
                                         exc.location or '?')
                             continue
                         all_redirects = False
+                        report_host_failure(endpoint)
                         log.warning("[%s] DC%d%s CF handshake: %s",
                                     label, dc, media_tag, exc.status_line)
                     except Exception as exc:
                         _stats.ws_errors += 1
                         all_redirects = False
+                        report_host_failure(endpoint)
                         err_str = str(exc)
                         if ('CERTIFICATE_VERIFY_FAILED' in err_str or
                                 'Hostname mismatch' in err_str):
                             log.warning("[%s] DC%d%s CF SSL error: %s",
-                                        label, dc, media_tag, exc)
+                                        label, dc, media_tag, _exc_text(exc))
                         else:
                             log.warning("[%s] DC%d%s CF connect failed: %s",
-                                        label, dc, media_tag, exc)
+                                        label, dc, media_tag, _exc_text(exc))
                     if ws is not None:
-                        base = host
-                        if base.startswith("kws"):
-                            parts = base.split('.', 1)
-                            base = parts[1] if len(parts) > 1 else base
-                        CFPROXY_ACTIVE_DOMAIN = base
+                        CFPROXY_ACTIVE_DOMAIN = sni
                         break
+
 
             if ws is not None:
                 break
@@ -1356,17 +1651,12 @@ async def _handle_client(reader, writer):
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
-_server_instance   = None
-_server_stop_event = None
-
-
 async def _run(port: int, dc_opt: Dict[int, List[str]],
                stop_event: Optional[asyncio.Event] = None,
                host: str = '127.0.0.1'):
-    global _dc_opt, _server_instance, _server_stop_event
+    global _dc_opt
     global CFPROXY_DOMAINS, CFPROXY_ACTIVE_DOMAIN
-    _dc_opt            = dc_opt
-    _server_stop_event = stop_event
+    _dc_opt = dc_opt
 
     _ws_pool.reset()
     _ws_blacklist.clear()
@@ -1374,16 +1664,12 @@ async def _run(port: int, dc_opt: Dict[int, List[str]],
     stop_cfproxy_domain_refresh()
 
     if CFPROXY_ENABLED:
-        if CFPROXY_CUSTOM_DOMAINS:
-            CFPROXY_DOMAINS = list(CFPROXY_DOMAINS) or list(CFPROXY_DEFAULT_DOMAINS)
-        else:
-            CFPROXY_DOMAINS = list(CFPROXY_DOMAINS) or list(CFPROXY_DEFAULT_DOMAINS)
-            if CFPROXY_AUTO_REFRESH:
-                start_cfproxy_domain_refresh()
+        CFPROXY_DOMAINS = list(CFPROXY_DOMAINS) or list(CFPROXY_DEFAULT_DOMAINS)
+        if not CFPROXY_CUSTOM_DOMAINS and CFPROXY_AUTO_REFRESH:
+            start_cfproxy_domain_refresh()
         if CFPROXY_DOMAINS:
             CFPROXY_ACTIVE_DOMAIN = random.choice(CFPROXY_DOMAINS)
-    server           = await asyncio.start_server(_handle_client, host, port)
-    _server_instance = server
+    server = await asyncio.start_server(_handle_client, host, port)
     for sock in server.sockets or []:
         try:
             sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
@@ -1429,6 +1715,8 @@ async def _run(port: int, dc_opt: Dict[int, List[str]],
                      _stats.summary(), bl)
             # FIX-4: Периодическая очистка просроченных cooldown-записей
             _cleanup_expired_cooldowns()
+            if _host_cooldown_until:
+                log.debug("host cooldowns active: %d", len(_host_cooldown_until))
 
     asyncio.create_task(log_stats())
     await _ws_pool.warmup(dc_opt)
@@ -1452,7 +1740,6 @@ async def _run(port: int, dc_opt: Dict[int, List[str]],
             await server.serve_forever()
         except asyncio.CancelledError:
             pass
-    _server_instance = None
 
 
 def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, List[str]]:
@@ -1467,7 +1754,7 @@ def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, List[str]]:
             dc_n = int(dc_s)
             _socket.inet_aton(ip_s)
         except (ValueError, OSError):
-            raise ValueError(f"Invalid --dc-ip {entry!r}")
+            raise ValueError(f"Invalid --dc-ip {entry!r}") from None
         if dc_n not in dc_opt:
             dc_opt[dc_n] = []
         if ip_s in dc_opt[dc_n]:
@@ -1478,18 +1765,6 @@ def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, List[str]]:
                         dc_n, ip_s)
         dc_opt[dc_n].append(ip_s)
     return dc_opt
-
-
-# Public alias for external use (called from windows.py)
-handle_client = _handle_client
-
-
-
-def run_proxy(port: int, dc_opt: Dict[int, List[str]],
-              stop_event: Optional[asyncio.Event] = None,
-              host: str = '127.0.0.1'):
-    """Run the proxy (blocking). Called from GUI thread."""
-    asyncio.run(_run(port, dc_opt, stop_event, host))
 
 
 def main():
@@ -1522,6 +1797,11 @@ def main():
                     help='Try CF proxy before direct WS')
     ap.add_argument('--no-cfproxy-auto-refresh', action='store_true',
                     help='Disable hourly CF domain auto-refresh')
+    ap.add_argument('--cfproxy-sni', choices=('auto', 'apex', 'sub'),
+                    default='auto',
+                    help='SNI for CF connections: auto (domain, then apex '
+                         'fallback), apex (always apex, TLS still verified), '
+                         'sub (always kwsN.domain)')
     args = ap.parse_args()
 
     # FIX-6: Предупреждаем если прокси доступен снаружи
@@ -1530,13 +1810,14 @@ def main():
               "make sure this is intentional!", file=sys.stderr)
 
     global CFPROXY_ENABLED, CFPROXY_PRIORITY, CFPROXY_DOMAINS
-    global CFPROXY_CUSTOM_DOMAINS, CFPROXY_AUTO_REFRESH
+    global CFPROXY_CUSTOM_DOMAINS, CFPROXY_AUTO_REFRESH, CFPROXY_SNI_MODE
     global SOCKET_BUFFER_SIZE, WS_POOL_SIZE
     CFPROXY_DOMAINS = [d.strip().lower() for d in args.cfproxy_domain
                        if isinstance(d, str) and d.strip()]
     CFPROXY_CUSTOM_DOMAINS = bool(CFPROXY_DOMAINS)
     CFPROXY_PRIORITY = bool(args.cfproxy_priority)
     CFPROXY_AUTO_REFRESH = not bool(args.no_cfproxy_auto_refresh)
+    CFPROXY_SNI_MODE = args.cfproxy_sni
     CFPROXY_ENABLED = bool(args.cfproxy_enable or CFPROXY_DOMAINS)
     SOCKET_BUFFER_SIZE = max(4, args.buf_kb) * 1024
     WS_POOL_SIZE = max(0, args.pool_size)

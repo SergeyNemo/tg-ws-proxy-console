@@ -12,13 +12,14 @@ import asyncio
 import json
 import logging
 import logging.handlers
-import os
 import signal
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 import proxy.tg_ws_proxy as tg_ws_proxy
+from proxy.event_loop import install_self_pipe_guard
+from proxy.tg_ws_proxy import DomainCensorFilter
 
 
 # ============================================================================
@@ -38,6 +39,9 @@ LOGS_DIR = APP_DIR / "logs"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 LOG_FILE = LOGS_DIR / "proxy.log"
 
+# Области, где допустимо связываться по сети (защита от случайного 0.0.0.0)
+SAFE_HOSTS = {'127.0.0.1', '::1', 'localhost'}
+
 DEFAULT_CONFIG = {
     "port": 1080,
     "host": "127.0.0.1",
@@ -45,13 +49,14 @@ DEFAULT_CONFIG = {
     "password": "your_password_here",
     "dc_ip": [
         "2:149.154.167.220",
-        "4:149.154.167.92",
+        "4:149.154.167.220",
         "203:149.154.167.220"
     ],
-    "cfproxy_enabled": False,
-    "cfproxy_priority": False,
+    "cfproxy_enabled": True,
+    "cfproxy_priority": True,
     "cfproxy_auto_refresh": True,
     "cfproxy_domains": [],
+    "cfproxy_sni": "auto",
     "buf_kb": 256,
     "pool_size": 4,
     "verbose": False,
@@ -64,29 +69,44 @@ DEFAULT_CONFIG = {
 def setup_logging(verbose: bool = False) -> None:
     """Настройка логирования в консоль и файл."""
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     log_format = logging.Formatter(
         fmt='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    
-    # Корневой логгер
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
-    
-    # Консоль
+
+    # Логгер приложения: останавливаемся на INFO без -v, чтобы DEBUG-спам
+    # не раздувал файл (и не светил клиентские адреса).
+    proxy_logger = logging.getLogger('tg-ws-proxy')
+    proxy_logger.setLevel(logging.DEBUG if verbose else logging.INFO)
+    proxy_logger.propagate = False
+    for handler in list(proxy_logger.handlers):
+        proxy_logger.removeHandler(handler)
+
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(log_format)
-    root_logger.addHandler(console_handler)
-    
-    # Файл (rotating)
+    console_handler.addFilter(DomainCensorFilter())
+    proxy_logger.addHandler(console_handler)
+
     file_handler = logging.handlers.RotatingFileHandler(
         LOG_FILE,
         maxBytes=10 * 1024 * 1024,  # 10 МБ
-        backupCount=3
+        backupCount=3,
+        encoding='utf-8',
     )
     file_handler.setFormatter(log_format)
-    root_logger.addHandler(file_handler)
+    file_handler.addFilter(DomainCensorFilter())
+    proxy_logger.addHandler(file_handler)
+
+    # asyncio и прочие библиотеки: только предупреждения и выше.
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.WARNING if not verbose else logging.INFO)
+    for handler in list(root_logger.handlers):
+        root_logger.removeHandler(handler)
+    root_console = logging.StreamHandler(sys.stderr)
+    root_console.setFormatter(log_format)
+    root_console.addFilter(DomainCensorFilter())
+    root_logger.addHandler(root_console)
 
 
 # ============================================================================
@@ -101,11 +121,11 @@ def load_config() -> Dict[str, Any]:
         log.error(f"Please create {CONFIG_FILE} with the following template:")
         print(json.dumps(DEFAULT_CONFIG, indent=2))
         sys.exit(1)
-    
+
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
             config = json.load(f)
-        
+
         # Валидация обязательных полей
         required_keys = {"port", "host", "username", "password"}
         missing = required_keys - set(config.keys())
@@ -113,7 +133,7 @@ def load_config() -> Dict[str, Any]:
             log = logging.getLogger("tg-ws-console")
             log.error(f"Missing required config keys in {CONFIG_FILE}: {missing}")
             sys.exit(1)
-        
+
         return config
     except json.JSONDecodeError as e:
         log = logging.getLogger("tg-ws-console")
@@ -125,6 +145,15 @@ def load_config() -> Dict[str, Any]:
         sys.exit(1)
 
 
+def _validate_host(host: str, log) -> str:
+    """FIX-6: предупреждаем (но не блокируем) при прослушке вне loopback."""
+    if host in SAFE_HOSTS:
+        return host
+    log.warning("[!] Listening on %s — proxy is reachable from the local "
+                "network; make sure SOCKS5 auth is enabled", host)
+    return host
+
+
 # ============================================================================
 # Proxy Server
 # ============================================================================
@@ -132,7 +161,7 @@ def load_config() -> Dict[str, Any]:
 async def run_proxy(config: Dict[str, Any]) -> None:
     """Запускает SOCKS5 прокси-сервер с аутентификацией."""
     log = logging.getLogger("tg-ws-console")
-    
+
     port = config.get("port", 1080)
     host = config.get("host", "127.0.0.1")
     username = config.get("username", "telegram")
@@ -142,6 +171,7 @@ async def run_proxy(config: Dict[str, Any]) -> None:
     cfproxy_priority = bool(config.get("cfproxy_priority", False))
     cfproxy_auto_refresh = bool(config.get("cfproxy_auto_refresh", True))
     cfproxy_domains = config.get("cfproxy_domains", [])
+    cfproxy_sni = config.get("cfproxy_sni", "auto")
     buf_kb = config.get("buf_kb", 256)
     pool_size = config.get("pool_size", 4)
     verbose = config.get("verbose", False)
@@ -160,7 +190,27 @@ async def run_proxy(config: Dict[str, Any]) -> None:
         sys.exit(1)
     cfproxy_domains = [d.strip().lower() for d in cfproxy_domains
                        if isinstance(d, str) and d.strip()]
-    
+    if cfproxy_sni not in ('auto', 'apex', 'sub'):
+        log.warning("Invalid cfproxy_sni=%r, falling back to 'auto'", cfproxy_sni)
+        cfproxy_sni = 'auto'
+
+    # Автодополнение dc_ip: если настроен единственный доступный адрес,
+    # закрываем DC 1-5 и 203, чтобы вся маршрутизация шла через CF/WS-путь,
+    # а не сыпала "unknown DCn -> TCP passthrough" в мёртвые IP.
+    primary_ips = {entry.split(':', 1)[1] for entry in dc_ip
+                   if isinstance(entry, str) and ':' in entry}
+    if len(primary_ips) == 1:
+        fill_ip = next(iter(primary_ips))
+        present = {entry.split(':', 1)[0] for entry in dc_ip
+                   if isinstance(entry, str) and ':' in entry}
+        for needed_dc in ('1', '2', '3', '4', '5', '203'):
+            if needed_dc not in present:
+                dc_ip = list(dc_ip) + [f"{needed_dc}:{fill_ip}"]
+                log.info("Auto-added DC%s -> %s (single reachable DC address)",
+                         needed_dc, fill_ip)
+
+    host = _validate_host(str(host), log)
+
     # Передаём аутентификацию в tg_ws_proxy через глобальные переменные
     tg_ws_proxy.SOCKS5_USERNAME = username
     tg_ws_proxy.SOCKS5_PASSWORD = password
@@ -170,16 +220,17 @@ async def run_proxy(config: Dict[str, Any]) -> None:
     tg_ws_proxy.CFPROXY_DOMAINS = cfproxy_domains
     tg_ws_proxy.CFPROXY_CUSTOM_DOMAINS = bool(cfproxy_domains)
     tg_ws_proxy.CFPROXY_AUTO_REFRESH = bool(cfproxy_auto_refresh)
+    tg_ws_proxy.CFPROXY_SNI_MODE = cfproxy_sni
     tg_ws_proxy.SOCKET_BUFFER_SIZE = max(4, int(buf_kb)) * 1024
     tg_ws_proxy.WS_POOL_SIZE = max(0, int(pool_size))
-    
+
     # Распарсим список DC-адресов
     try:
         dc_opt = tg_ws_proxy.parse_dc_ip_list(dc_ip)
     except ValueError as e:
         log.error(f"Invalid DC IP list: {e}")
         sys.exit(1)
-    
+
     # Запускаем основной сервер
     try:
         log.info(f"Starting TG WS Proxy on {host}:{port}")
@@ -187,7 +238,7 @@ async def run_proxy(config: Dict[str, Any]) -> None:
             log.info(f"Authentication enabled (username: {username})")
         else:
             log.warning("[!] Using default password - please change in config/config.json")
-        
+
         if dc_ip:
             log.info(f"DC addresses: {len(dc_opt)} DataCenters configured")
         if tg_ws_proxy.CFPROXY_ENABLED:
@@ -196,13 +247,13 @@ async def run_proxy(config: Dict[str, Any]) -> None:
                     else ("auto-refresh" if tg_ws_proxy.CFPROXY_AUTO_REFRESH else "default-pool"))
             log.info(f"CF proxy enabled: {order}, mode={mode}")
         log.info(f"Performance: buf_kb={max(4, int(buf_kb))}, pool_size={max(0, int(pool_size))}")
-        
+
         log.info(f"Verbose logging: {'ON' if verbose else 'OFF'}")
         log.info("Proxy is running. Press Ctrl+C to stop.\n")
-        
+
         # Используем встроенную функцию запуска прокси
         await tg_ws_proxy._run(port, dc_opt, stop_event=None, host=host)
-    
+
     except KeyboardInterrupt:
         log.info("\nShutting down...")
     except Exception as e:
@@ -216,34 +267,40 @@ async def run_proxy(config: Dict[str, Any]) -> None:
 
 def main() -> None:
     """Основная функция."""
-    # Загружаем конфиг перед логированием, чтобы узнать verbose
-    setup_logging(verbose=False)
     config = load_config()
-    verbose = config.get("verbose", False)
-    
-    # Настраиваем логирование
-    logging.getLogger().setLevel(logging.DEBUG if verbose else logging.INFO)
-    
+    verbose = bool(config.get("verbose", False))
+
+    setup_logging(verbose=verbose)
+
     log = logging.getLogger("tg-ws-console")
     log.info("=" * 70)
     log.info("TG WS Proxy — Console Edition (Secure)")
     log.info("=" * 70)
     log.info(f"Config loaded: {CONFIG_FILE}")
-    
+
     # Обработчик сигналов
     def signal_handler(signum, frame):
         log.info("Signal received, shutting down...")
         sys.exit(0)
-    
+
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    
+
+    # Windows: guard против потери wakeup-сокета proactor event loop
+    loop = asyncio.new_event_loop()
+    install_self_pipe_guard(loop)
+    asyncio.set_event_loop(loop)
+
     # Запускаем asyncio loop
     try:
-        asyncio.run(run_proxy(config))
+        loop.run_until_complete(run_proxy(config))
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
         log.info("TG WS Proxy stopped.")
 
 
