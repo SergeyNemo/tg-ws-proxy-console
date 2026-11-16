@@ -5,17 +5,40 @@
 
 ## Быстрый старт
 
+### Linux (проверено на Debian 13)
+
 1. Установите зависимости:
 ```bash
-pip install -r requirements.txt
+sudo apt install python3-cryptography python3-certifi
 ```
 
 2. Создайте `config/config.json` (можно взять `config/config.example.json`).
 
 3. Запустите:
 ```bash
+python3 windows.py
+```
+
+### Windows (проверено на Windows 10)
+
+1. Установите зависимости:
+```bash
+pip install -r requirements.txt
+```
+2. Создайте `config/config.json` (можно взять `config/config.example.json`).
+
+3. Запустите:
+```bash
 python windows.py
 ```
+
+Или, если нужен exe:
+
+```bat
+build.bat
+```
+
+Потом из папки `dist` запустить `windows.exe`.
 
 ## Пример простого конфига
 
